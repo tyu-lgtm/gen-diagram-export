@@ -562,29 +562,30 @@ function memberEndpointNodes(model, group, byId = new Map(model.elements.map((el
   return [];
 }
 
-function dimensionItemsForPlane(model, plane, segments) {
-  if (!model.dimensions?.size || !segments.length) return [];
+function dimensionItemsForPlane(model, plane) {
+  if (!model.dimensions?.size) return [];
   const axis = plane.type === 3 ? 0 : 1;
-  const points = segments.flatMap(({ a, b }) => [a, b]);
-  const [minU, maxU] = rangeOf(points.map((point) => point[axis]));
-  const [minZ, maxZ] = rangeOf(points.map((point) => point[2]));
-  const padU = Math.max((maxU - minU) * 0.35, 1);
-  const padZ = Math.max((maxZ - minZ) * 0.5, 1);
-  const candidates = [...model.dimensions.values()].map((view) => {
-    const origin = dimensionPoint(view, [0, 0, 0]);
-    const xDirection = dimensionPoint(view, [1, 0, 0]).map((value, i) => value - origin[i]);
+  const preferredName = plane.type === 3 ? "軸1" : "軸2";
+  const candidates = [...model.dimensions.values()].map((candidate) => {
+    const origin = dimensionPoint(candidate, [0, 0, 0]);
+    const xDirection = dimensionPoint(candidate, [1, 0, 0]).map((value, i) => value - origin[i]);
+    const yDirection = dimensionPoint(candidate, [0, 1, 0]).map((value, i) => value - origin[i]);
     const excludedAxis = plane.type === 3 ? 1 : 0;
-    const alignment = Math.abs(xDirection[axis]) - Math.abs(xDirection[excludedAxis]);
-    const items = view.items.map((item) => ({ ...item, a: dimensionPoint(view, item.start), b: dimensionPoint(view, item.end) }))
-      .filter(({ a, b, type }) => [a, b].some((point) => point[axis] >= minU - padU && point[axis] <= maxU + padU &&
-        (type === 1 || (point[2] >= minZ - padZ && point[2] <= maxZ + padZ))));
-    return { alignment, items };
-  }).filter(({ alignment, items }) => alignment > 0.5 && items.length);
-  // Match by view orientation, not the optional Japanese names 軸1/軸2.
-  // Those names differ between MGTX files; a missing name previously removed
-  // every grid label without any warning.
-  candidates.sort((a, b) => b.items.filter((item) => item.type === 1 && item.text.trim()).length - a.items.filter((item) => item.type === 1 && item.text.trim()).length);
-  return candidates[0]?.items || [];
+    const alignment = Math.min(Math.abs(xDirection[axis]) - Math.abs(xDirection[excludedAxis]),
+      Math.abs(yDirection[2]) - Math.abs(yDirection[excludedAxis]));
+    const labelCount = candidate.items.filter((item) => item.type === 1 && item.text.trim()).length;
+    return { candidate, alignment, labelCount };
+  }).filter(({ alignment, candidate }) => alignment > 0.5 && candidate.items.length);
+  candidates.sort((a, b) => (b.candidate.name === preferredName) - (a.candidate.name === preferredName) || b.labelCount - a.labelCount);
+  const view = candidates[0]?.candidate;
+  if (!view) return [];
+  // The dimension view is registered for the whole elevation. Filtering it by
+  // the extents of the current members discarded distant grid names such as
+  // い・ろ・は even though those labels existed in *DIMENSION-LINETEXT.
+  return view.items.map((item) => ({
+    ...item, viewName: view.name,
+    a: dimensionPoint(view, item.start), b: dimensionPoint(view, item.end),
+  }));
 }
 
 function rangeOf(values, fallback = [0, 1]) {
@@ -681,7 +682,7 @@ function numberingDiagramSvg(plane, kind, options = {}) {
   const segments = elementsOnPlane(model, plane), groups = numberingGroups(model, plane, kind);
   const width = 1200, height = 590, frame = $("#frame")?.value !== "off";
   const dimensionEnabled = options.showDimensions ?? $("#showDimensions")?.checked ?? true;
-  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane, segments) : [];
+  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane) : [];
   const axis = plane.type === 3 ? 0 : 1;
   const chartLeft = 190, chartRight = 1040, chartTop = 160, chartBottom = 413;
   const bounds = drawingFit([...segments.flatMap(({ a, b }) => [a, b]), ...dimensionItems.flatMap(({ a, b }) => [a, b])], axis,
@@ -750,8 +751,9 @@ function numberingDiagramSvg(plane, kind, options = {}) {
   }
   const diagramName = kind === "member" ? "部材番号" : "断面番号";
   const lineName = drawingTitle(plane, "", kind).line;
-  app.lastDiagnostics = { plane: plane.name, diagramType: kind, total: groups.length, resultCount: numberLabels.length, elements: segments.length };
-  return `<svg class="diagram-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${escapeHtml(plane.name)} ${diagramName}図">
+  const dimensionViewName = dimensionItems[0]?.viewName || "";
+  app.lastDiagnostics = { plane: plane.name, diagramType: kind, total: groups.length, resultCount: numberLabels.length, elements: segments.length, dimensionViewName };
+  return `<svg class="diagram-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" data-dimension-view="${escapeHtml(dimensionViewName)}" role="img" aria-label="${escapeHtml(plane.name)} ${diagramName}図">
     <style>.dimension-line{stroke:${dimensionColor};stroke-width:${dimensionLineWidth};fill:none}.dimension-label,.number-label{font-family:${fontFamily};font-size:${fontSize.toFixed(2)}px;font-weight:${fontWeight};fill:${color}}.sheet-title{font-family:${fontFamily};font-size:${ptToSvg(8).toFixed(2)}px;fill:${color}}</style>
     <rect x="0" y="0" width="${width}" height="${height}" fill="#fff"/>
     <rect x="64" y="58" width="1072" height="473" fill="#fff" ${frame ? 'stroke="#3e4642" stroke-width=".8"' : ""}/>
@@ -791,7 +793,7 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
   const minimum = Math.min(0, rawMinimum), maximum = Math.max(0, rawMaximum);
   const peak = Math.max(Math.abs(minimum), Math.abs(maximum)) || 1;
   const dimensionEnabled = options.showDimensions ?? $("#showDimensions")?.checked ?? true;
-  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane, planeMembers) : [];
+  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane) : [];
   const axis = plane.type === 3 ? 0 : 1;
   const width = 1200, height = 590, frame = $("#frame")?.value !== "off";
   const legendPosition = options.legendPosition || $("#legendPosition")?.value || "right";
@@ -936,6 +938,7 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
   const diagramMembers = comp === "N" ? memberData : memberData.filter(({ element }) => element.type === "BEAM");
   app.lastDiagnostics = {
     plane: plane.name, loadCase, component: comp, total: diagramMembers.length,
+    dimensionViewName: dimensionItems[0]?.viewName || "",
     beam: diagramMembers.filter(({ element }) => element.type === "BEAM").length,
     truss: diagramMembers.filter(({ element }) => element.type !== "BEAM").length,
     trussSkeletonOnly: comp === "N" ? 0 : memberData.length - diagramMembers.length,
@@ -983,7 +986,7 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
     <line x1="${metaX}" y1="498" x2="${metaX + 174}" y2="498" class="legend-rule"/>
     <g transform="translate(${metaX + 123} 520)"><line x1="0" y1="0" x2="24" y2="0" stroke="#ec3029" stroke-width="1.2"/><path d="M24 0l-5 -3v6z" fill="#ec3029"/><text x="27" y="3" class="triad-label" fill="#ec3029">X</text><line x1="0" y1="0" x2="-14" y2="-14" stroke="#13a74c" stroke-width="1.2"/><path d="M-14 -14l1 6 5 -4z" fill="#13a74c"/><text x="-23" y="-17" class="triad-label" fill="#13a74c">Y</text><line x1="0" y1="0" x2="0" y2="-25" stroke="#2568dc" stroke-width="1.2"/><path d="M0 -25l-3 5h6z" fill="#2568dc"/><text x="3" y="-20" class="triad-label" fill="#2568dc">Z</text></g>
   </g>`;
-  return `<svg class="diagram-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${escapeHtml(plane.name)} ${escapeHtml(loadCase)} ${escapeHtml(comp)}応力図">
+  return `<svg class="diagram-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" data-dimension-view="${escapeHtml(dimensionItems[0]?.viewName || "")}" role="img" aria-label="${escapeHtml(plane.name)} ${escapeHtml(loadCase)} ${escapeHtml(comp)}応力図">
     <style>
       .dimension-line{stroke:${dimensionColor};stroke-width:${dimensionLineWidth};fill:none}
       .dimension-text,.value-label{font-family:${fontFamily};font-size:${labelFontSize.toFixed(2)}px;font-weight:${fontWeight};fill:${valueColor}}
@@ -1054,6 +1057,7 @@ function updatePreview() {
       ? `表示: ${diagnostic.resultCount}/${diagnostic.total} 番号（面上の線要素 ${diagnostic.elements}）`
       : `表示: ${diagnostic.resultCount}/${diagnostic.total} 対象要素（梁 ${diagnostic.beam}・トラス系 ${diagnostic.truss}）${diagnostic.trussSkeletonOnly ? `／トラス系 ${diagnostic.trussSkeletonOnly} は骨組み線のみ` : ""}${diagnostic.missingIds.length ? `／結果なし: ${diagnostic.missingIds.join(", ")}` : ""}${diagnostic.outOfPlaneCount ? `／面外方向を図面内へ代替表示: ${diagnostic.outOfPlaneCount}` : ""}`
     : "";
+  if (diagnostic?.dimensionViewName && hasPlane) $("#coverageStatus").textContent += `／寸法ビュー: ${diagnostic.dimensionViewName}`;
 }
 
 function updateOutputCount() {
