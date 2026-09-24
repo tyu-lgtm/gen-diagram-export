@@ -94,9 +94,8 @@ function parseModel(text) {
       nodes: nodeIds, beta: Number(c[6] || 0),
     });
   }
-  // mgt2excel treats *MEMBER as the preferred explicit assignment and gives
-  // every unassigned line element its own member. Diagram results remain per
-  // element: joining ANL values here would change MIDAS Beam Diagram geometry.
+  // Keep the ANL contour per element, but use these assignments when placing
+  // result labels so a single designated member receives one set of values.
   const members = [], memberByElement = new Map();
   let pendingMember = "";
   const addMember = (line) => {
@@ -139,7 +138,7 @@ function parseModel(text) {
     const type = Number(c[1]), tolerance = Number(c[2]), coordinate = Number(c[3]);
     if (!c[0] || ![3, 4].includes(type) || !Number.isFinite(coordinate)) return [];
     return [{ name: c[0].trim(), type, tolerance: Number.isFinite(tolerance) ? tolerance : 0.01, coordinate }];
-  }).slice(0, 100);
+  });
   const dimensions = new Map();
   for (const line of rows("DIMENSION")) {
     const c = splitCsv(line);
@@ -563,25 +562,131 @@ function memberEndpointNodes(model, group, byId = new Map(model.elements.map((el
   return [];
 }
 
+function dimensionItemsForPlane(model, plane, segments) {
+  if (!model.dimensions?.size || !segments.length) return [];
+  const axis = plane.type === 3 ? 0 : 1;
+  const points = segments.flatMap(({ a, b }) => [a, b]);
+  const [minU, maxU] = rangeOf(points.map((point) => point[axis]));
+  const [minZ, maxZ] = rangeOf(points.map((point) => point[2]));
+  const padU = Math.max((maxU - minU) * 0.35, 1);
+  const padZ = Math.max((maxZ - minZ) * 0.5, 1);
+  const candidates = [...model.dimensions.values()].map((view) => {
+    const origin = dimensionPoint(view, [0, 0, 0]);
+    const xDirection = dimensionPoint(view, [1, 0, 0]).map((value, i) => value - origin[i]);
+    const excludedAxis = plane.type === 3 ? 1 : 0;
+    const alignment = Math.abs(xDirection[axis]) - Math.abs(xDirection[excludedAxis]);
+    const items = view.items.map((item) => ({ ...item, a: dimensionPoint(view, item.start), b: dimensionPoint(view, item.end) }))
+      .filter(({ a, b, type }) => [a, b].some((point) => point[axis] >= minU - padU && point[axis] <= maxU + padU &&
+        (type === 1 || (point[2] >= minZ - padZ && point[2] <= maxZ + padZ))));
+    return { alignment, items };
+  }).filter(({ alignment, items }) => alignment > 0.5 && items.length);
+  // Match by view orientation, not the optional Japanese names 軸1/軸2.
+  // Those names differ between MGTX files; a missing name previously removed
+  // every grid label without any warning.
+  candidates.sort((a, b) => b.items.filter((item) => item.type === 1 && item.text.trim()).length - a.items.filter((item) => item.type === 1 && item.text.trim()).length);
+  return candidates[0]?.items || [];
+}
+
+function rangeOf(values, fallback = [0, 1]) {
+  if (!values.length) return fallback;
+  let minimum = Infinity, maximum = -Infinity;
+  for (const value of values) { minimum = Math.min(minimum, value); maximum = Math.max(maximum, value); }
+  return [minimum, maximum];
+}
+
+function drawingFit(points, axis, chart, requestedScale = 1) {
+  const u = points.map((point) => point[axis]), z = points.map((point) => point[2]);
+  const [minU, maxU] = rangeOf(u), [minZ, maxZ] = rangeOf(z);
+  const spanU = maxU - minU, spanZ = maxZ - minZ;
+  const innerW = chart.right - chart.left - 40, innerH = chart.bottom - chart.top - 40;
+  const fit = Math.min(spanU ? innerW / spanU : Infinity, spanZ ? innerH / spanZ : Infinity) * Math.max(0.1, Number(requestedScale) || 1);
+  const safeFit = Number.isFinite(fit) ? Math.min(fit,
+    spanU ? (chart.right - chart.left - 10) / spanU : Infinity,
+    spanZ ? (chart.bottom - chart.top - 10) / spanZ : Infinity) : 1;
+  return { minU, maxZ, spanU, spanZ, fit: safeFit,
+    x0: (chart.left + chart.right - spanU * safeFit) / 2,
+    y0: (chart.top + chart.bottom - spanZ * safeFit) / 2 };
+}
+
+function memberStressLabels(model, plane, memberData, valueMode) {
+  if (valueMode === "none") return [];
+  const dataById = new Map(memberData.map((entry) => [entry.element.id, entry]));
+  const groups = numberingGroups(model, plane, "member");
+  const explicitMembers = new Map(model.members.map((member) => [String(member.id), member]));
+  const labels = [];
+  for (const group of groups) {
+    const parts = group.elementIds.map((id) => dataById.get(id)).filter((part) => part?.values.length);
+    if (!parts.length) continue;
+    const byNode = new Map();
+    for (const part of parts) for (const nodeId of part.element.nodes) {
+      if (!byNode.has(nodeId)) byNode.set(nodeId, []);
+      byNode.get(nodeId).push(part);
+    }
+    const ends = [...byNode].filter(([, incident]) => incident.length === 1).map(([id]) => id);
+    const explicit = explicitMembers.get(group.memberId);
+    let startNode = ends.includes(parts[0].element.nodes[0]) ? parts[0].element.nodes[0] : ends[0];
+    if (explicit?.reverse && ends.length === 2) startNode = ends.find((id) => id !== startNode);
+    const ordered = [], visited = new Set();
+    let node = startNode;
+    while (node !== undefined) {
+      const part = (byNode.get(node) || []).find((candidate) => !visited.has(candidate.element.id));
+      if (!part) break;
+      visited.add(part.element.id);
+      const forward = part.element.nodes[0] === node;
+      ordered.push({ part, forward });
+      node = part.element.nodes[forward ? 1 : 0];
+    }
+    // An invalid/branched *MEMBER still gets one label set, never one per element.
+    for (const part of parts) if (!visited.has(part.element.id)) ordered.push({ part, forward: true });
+    const samples = [];
+    let distance = 0;
+    for (const { part, forward } of ordered) {
+      const length = Math.hypot(...part.a.map((value, i) => part.b[i] - value));
+      for (let i = 0; i < part.values.length; i++) {
+        const ratio = part.values.length === 1 ? 0.5 : i / (part.values.length - 1);
+        const localRatio = forward ? ratio : 1 - ratio;
+        samples.push({ value: part.values[i], station: distance + localRatio * length,
+          point: part.a.map((value, axis) => value + (part.b[axis] - value) * ratio), part });
+      }
+      distance += length;
+    }
+    samples.sort((a, b) => a.station - b.station);
+    if (!samples.length) continue;
+    const at = (station) => {
+      let after = samples.findIndex((sample) => sample.station >= station);
+      if (after <= 0) return samples[0];
+      const left = samples[after - 1], right = samples[after];
+      const ratio = (station - left.station) / (right.station - left.station || 1);
+      return { value: left.value + (right.value - left.value) * ratio,
+        point: left.point.map((value, i) => value + (right.point[i] - value) * ratio), part: left.part };
+    };
+    const maxAbs = samples.reduce((best, sample) => Math.abs(sample.value) > Math.abs(best.value) ? sample : best);
+    const min = samples.reduce((best, sample) => sample.value < best.value ? sample : best);
+    const max = samples.reduce((best, sample) => sample.value > best.value ? sample : best);
+    const center = at(distance / 2);
+    const centered = (sample) => ({ ...sample, point: center.point, part: center.part, memberCentered: true });
+    const chosen = valueMode === "abs" ? [centered(maxAbs)]
+      : valueMode === "three" ? [at(0), center, at(distance)]
+      : valueMode === "all" ? [at(0), centered(maxAbs), at(distance)]
+      : valueMode === "minmax" ? min === max ? [min] : [min, max]
+      : Array.from({ length: 5 }, (_, i) => at(distance * i / 4));
+    for (const sample of chosen) labels.push({ ...sample, memberId: group.memberId });
+  }
+  return labels;
+}
+
 function numberingDiagramSvg(plane, kind, options = {}) {
   const model = app.model?.parsed;
   if (!model || !plane || typeof plane === "string") return "";
   const segments = elementsOnPlane(model, plane), groups = numberingGroups(model, plane, kind);
   const width = 1200, height = 590, frame = $("#frame")?.value !== "off";
   const dimensionEnabled = options.showDimensions ?? $("#showDimensions")?.checked ?? true;
-  const dimensionView = model.dimensions?.get(plane.type === 3 ? "軸1" : "軸2");
-  const dimensionItems = dimensionEnabled && dimensionView ? dimensionView.items.map((item) => ({
-    ...item, a: dimensionPoint(dimensionView, item.start), b: dimensionPoint(dimensionView, item.end),
-  })) : [];
+  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane, segments) : [];
   const axis = plane.type === 3 ? 0 : 1;
-  const allU = [...segments.flatMap(({ a, b }) => [a[axis], b[axis]]), ...dimensionItems.flatMap(({ a, b }) => [a[axis], b[axis]])];
-  const allZ = [...segments.flatMap(({ a, b }) => [a[2], b[2]]), ...dimensionItems.flatMap(({ a, b }) => [a[2], b[2]])];
-  const minU = Math.min(...allU, 0), maxU = Math.max(...allU, 1), minZ = Math.min(...allZ, 0), maxZ = Math.max(...allZ, 1);
   const chartLeft = 190, chartRight = 1040, chartTop = 160, chartBottom = 413;
-  const spanU = maxU - minU || 1, spanZ = maxZ - minZ || 1;
-  const fit = Math.min((chartRight - chartLeft) / spanU, (chartBottom - chartTop) / spanZ) * Number(options.scale || $("#scale")?.value || 1);
-  const usedW = spanU * fit, usedH = spanZ * fit;
-  const x0 = chartLeft + (chartRight - chartLeft - usedW) / 2, y0 = chartTop + (chartBottom - chartTop - usedH) / 2;
+  const bounds = drawingFit([...segments.flatMap(({ a, b }) => [a, b]), ...dimensionItems.flatMap(({ a, b }) => [a, b])], axis,
+    { left: chartLeft, right: chartRight, top: chartTop, bottom: chartBottom }, options.scale || $("#scale")?.value || 1);
+  const { minU, maxZ, fit, x0, y0 } = bounds;
   const pt2 = (point) => [x0 + (point[axis] - minU) * fit, y0 + (maxZ - point[2]) * fit];
   const ptToSvg = (pt) => Number(pt) * width * 25.4 / (277 * 72);
   const fontSize = ptToSvg(options.labelFontSize || $("#labelFontSize")?.value || 8);
@@ -682,23 +787,12 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
     return { element, a, b, item, values };
   });
   const selectedValues = memberData.flatMap(({ values }) => values);
-  const minimum = Math.min(0, ...selectedValues), maximum = Math.max(0, ...selectedValues);
+  const [rawMinimum, rawMaximum] = rangeOf(selectedValues, [0, 0]);
+  const minimum = Math.min(0, rawMinimum), maximum = Math.max(0, rawMaximum);
   const peak = Math.max(Math.abs(minimum), Math.abs(maximum)) || 1;
   const dimensionEnabled = options.showDimensions ?? $("#showDimensions")?.checked ?? true;
-  const dimensionView = model.dimensions?.get(plane.type === 3 ? "軸1" : "軸2");
-  const dimensionItems = dimensionEnabled && dimensionView ? dimensionView.items.map((item) => ({
-    ...item, a: dimensionPoint(dimensionView, item.start), b: dimensionPoint(dimensionView, item.end),
-  })) : [];
+  const dimensionItems = dimensionEnabled ? dimensionItemsForPlane(model, plane, planeMembers) : [];
   const axis = plane.type === 3 ? 0 : 1;
-  const allU = [
-    ...planeMembers.flatMap(({ a, b }) => [a[axis], b[axis]]),
-    ...dimensionItems.flatMap(({ a, b }) => [a[axis], b[axis]]),
-  ];
-  const allZ = [
-    ...planeMembers.flatMap(({ a, b }) => [a[2], b[2]]),
-    ...dimensionItems.flatMap(({ a, b }) => [a[2], b[2]]),
-  ];
-  const minU = Math.min(...allU, 0), maxU = Math.max(...allU, 1), minZ = Math.min(...allZ, 0), maxZ = Math.max(...allZ, 1);
   const width = 1200, height = 590, frame = $("#frame")?.value !== "off";
   const legendPosition = options.legendPosition || $("#legendPosition")?.value || "right";
   const count = Number(options.contourColors || $("#contourColors")?.value || 12);
@@ -735,21 +829,46 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
   const chartRight = legendPosition === "left" ? 1124 : 986;
   const chartTop = 160, chartBottom = 413;
   const drawW = chartRight - chartLeft, drawH = chartBottom - chartTop;
-  const spanU = maxU - minU || 1, spanZ = maxZ - minZ || 1;
-  const fit = Math.min(drawW / spanU, drawH / spanZ);
-  const usedW = spanU * fit, usedH = spanZ * fit;
-  const x0 = chartLeft + (drawW - usedW) / 2, y0 = chartTop + (drawH - usedH) / 2;
+  const basePoints = [...planeMembers.flatMap(({ a, b }) => [a, b]), ...dimensionItems.flatMap(({ a, b }) => [a, b])];
+  const bounds = drawingFit(basePoints, axis, { left: chartLeft, right: chartRight, top: chartTop, bottom: chartBottom });
+  let { minU, maxZ, fit, x0, y0 } = bounds;
+  const usedW = bounds.spanU * fit, usedH = bounds.spanZ * fit;
   const scale = Number(options.scale || $("#scale")?.value || 1);
-  const forceScale = Math.min(92, Math.max(20, Math.min(usedW, usedH) * (["MZ", "MY"].includes(comp) ? 0.135 : 0.095))) * scale;
+  let forceScale = Math.min(92, Math.max(20, Math.min(usedW, usedH) * (["MZ", "MY"].includes(comp) ? 0.135 : 0.095))) * scale;
+  // The force envelope may protrude beyond the geometric model. Fit both in
+  // the printable chart, including dimensions, before drawing any labels.
+  const envelope = [];
+  const project = (p) => [x0 + (p[axis] - minU) * fit, y0 + (maxZ - p[2]) * fit];
+  for (const point of basePoints) envelope.push(project(point));
+  for (const { element, a, b, values } of memberData) {
+    if (!values.length) continue;
+    const A = project(a), B = project(b), dx = B[0] - A[0], dy = B[1] - A[1];
+    const direction = diagramDirection(element, a, b, plane, comp, [dy / (Math.hypot(dx, dy) || 1), -dx / (Math.hypot(dx, dy) || 1)]).vector;
+    values.forEach((value, i) => {
+      const ratio = values.length > 1 ? i / (values.length - 1) : 0.5;
+      envelope.push([A[0] + dx * ratio + direction[0] * value / peak * forceScale,
+        A[1] + dy * ratio + direction[1] * value / peak * forceScale]);
+    });
+  }
+  if (envelope.length) {
+    const [left, right] = rangeOf(envelope.map((point) => point[0]));
+    const [top, bottom] = rangeOf(envelope.map((point) => point[1]));
+    const margin = 24;
+    const correction = Math.min(1, (drawW - margin * 2) / (right - left || 1), (drawH - margin * 2) / (bottom - top || 1));
+    fit *= correction;
+    forceScale *= correction;
+    x0 = (chartLeft + chartRight) / 2 + (x0 - (left + right) / 2) * correction;
+    y0 = (chartTop + chartBottom) / 2 + (y0 - (top + bottom) / 2) * correction;
+  }
   const pt2 = (p) => [x0 + (p[axis] - minU) * fit, y0 + (maxZ - p[2]) * fit];
   const occupied = [];
   const labelSvg = [];
-  const registerText = (target, text, x, y, angle, className, reserve = false) => {
+  const registerText = (target, text, x, y, angle, className, reserve = false, memberId = null) => {
     const box = textBox(text, x, y, labelFontSize, angle);
     if (!reserve && hideOverlaps && occupied.some((other) => boxesOverlap(box, other, 2))) return false;
     occupied.push(box);
     const rotate = Math.abs(angle) > 0.001 ? ` transform="rotate(${angle.toFixed(1)} ${x.toFixed(1)} ${y.toFixed(1)})"` : "";
-    target.push(`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" class="${className}" font-size="${labelFontSize.toFixed(2)}"${rotate}>${escapeHtml(text)}</text>`);
+    target.push(`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" class="${className}" font-size="${labelFontSize.toFixed(2)}"${memberId === null ? "" : ` data-member-id="${escapeHtml(memberId)}"`}${rotate}>${escapeHtml(text)}</text>`);
     return true;
   };
   const dimensionLines = [], dimensionLabels = [];
@@ -794,30 +913,26 @@ function actualDiagramSvg(plane, loadCase, comp, options = {}) {
       }
     }
     memberLines.push(`<line data-element-id="${element.id}" data-member-id="${model.memberByElement.get(element.id)}" x1="${A[0].toFixed(1)}" y1="${A[1].toFixed(1)}" x2="${B[0].toFixed(1)}" y2="${B[1].toFixed(1)}" stroke="#4b5551" stroke-width="${element.type === "BEAM" ? 0.68 : 0.55}" stroke-linecap="round"/>`);
-    if (points.length && valueMode !== "none") {
-      for (const [labelIndex, { value, ratio }] of valueLabelPoints(values, valueMode).entries()) {
-        if (Math.abs(value) < peak * labelLimitPercent / 100) continue;
-        const memberCentered = valueMode === "abs" || (valueMode === "all" && labelIndex === 1);
-        const labelDirection = memberCentered ? memberAboveNormal(dx, dy) : [ox, oy];
-        const anchor = valueLabelPosition(A, [dx, dy], labelDirection, value, ratio, peak, forceScale, labelOffset, memberCentered);
-        // GEN NX places result text along the member axis; the diagram offset
-        // itself is already expressed by the perpendicular normal (nx, ny).
-        let angle = labelOrientation === "auto" ? Math.atan2(dy, dx) * 180 / Math.PI : Number(labelOrientation);
-        if (labelOrientation === "auto") {
-          // Keep auto-aligned labels upright while preserving their member axis.
-          if (angle > 90) angle -= 180;
-          else if (angle < -90) angle += 180;
-          if (memberCentered && Math.abs(Math.abs(angle) - 90) < 0.001) angle = -90;
-        } else {
-          while (angle > 180) angle -= 360;
-          while (angle < -180) angle += 360;
-        }
-        labelCandidates.push({ value, text: numberLabel(value), x: anchor[0], y: anchor[1], angle });
-      }
+  }
+  for (const { value, point, part, memberId, memberCentered } of memberStressLabels(model, plane, memberData, valueMode)) {
+    if (Math.abs(value) < peak * labelLimitPercent / 100) continue;
+    const A = pt2(part.a), B = pt2(part.b), dx = B[0] - A[0], dy = B[1] - A[1];
+    const normal = memberAboveNormal(dx, dy);
+    const direction = memberCentered ? normal : diagramDirection(part.element, part.a, part.b, plane, comp, normal).vector;
+    const anchor = valueLabelPosition(pt2(point), [0, 0], direction, value, 0, peak, forceScale, labelOffset, !!memberCentered);
+    let angle = labelOrientation === "auto" ? Math.atan2(dy, dx) * 180 / Math.PI : Number(labelOrientation);
+    if (labelOrientation === "auto") {
+      if (angle > 90) angle -= 180;
+      else if (angle < -90) angle += 180;
+      if (memberCentered && Math.abs(Math.abs(angle) - 90) < 0.001) angle = -90;
+    } else {
+      while (angle > 180) angle -= 360;
+      while (angle < -180) angle += 360;
     }
+    labelCandidates.push({ value, text: numberLabel(value), x: anchor[0], y: anchor[1], angle, memberId });
   }
   labelCandidates.sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
-  for (const label of labelCandidates) registerText(labelSvg, label.text, label.x, label.y, label.angle, "value-label");
+  for (const label of labelCandidates) registerText(labelSvg, label.text, label.x, label.y, label.angle, "value-label", false, label.memberId);
   const diagramMembers = comp === "N" ? memberData : memberData.filter(({ element }) => element.type === "BEAM");
   app.lastDiagnostics = {
     plane: plane.name, loadCase, component: comp, total: diagramMembers.length,

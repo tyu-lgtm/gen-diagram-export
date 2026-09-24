@@ -102,10 +102,10 @@
               <summary>詳細設定</summary>
               <div class="advanced-fields">
                 <label>用紙方向<select id="orientation"><option value="landscape">横向き（A4）</option><option value="portrait">縦向き（A4）</option></select></label>
-                <label>図の倍率<select id="scale"><option value="1">標準</option><option value="1.25">大きめ</option><option value="0.8">小さめ</option></select></label>
+                <label>図の倍率（用紙内で自動調整）<select id="scale"><option value="1">標準</option><option value="1.25">大きめ</option><option value="0.8">小さめ</option></select></label>
                 <label>図枠<select id="frame"><option value="on">あり</option><option value="off">なし</option></select></label>
                 <label class="stress-only"><span>図の塗り方</span><select id="diagramFill"><option value="solid" selected>ソリッド塗り</option><option value="line">ライン塗り</option><option value="none">塗りなし</option></select></label>
-                <label class="stress-only"><span>数値表示</span><select id="valueMode"><option value="abs" selected>絶対最大値（要素中央付近）</option><option value="three">3点（I・中央・J）</option><option value="all">GEN NX All（I・絶対最大・J）</option><option value="minmax">最小・最大（発生位置）</option><option value="five">5点すべて</option><option value="none">表示しない</option></select></label>
+                <label class="stress-only"><span>数値表示（単一部材ごと）</span><select id="valueMode"><option value="abs" selected>絶対最大値（部材中央付近）</option><option value="three">3点（部材I・中央・J）</option><option value="all">All（部材I・絶対最大・J）</option><option value="minmax">最小・最大（発生位置）</option><option value="five">5点（部材全長）</option><option value="none">表示しない</option></select></label>
                 <label class="stress-only"><span>凡例位置</span><select id="legendPosition"><option value="right" selected>右側</option><option value="left">左側</option></select></label>
                 <label class="stress-only"><span>コンター階調</span><select id="contourColors"><option value="6">6色</option><option value="12" selected>12色</option><option value="18">18色</option><option value="24">24色</option></select></label>
                 <label class="stress-only"><span>値の小数桁</span><select id="decimalPlaces"><option value="0">0桁</option><option value="1" selected>1桁</option><option value="2">2桁</option><option value="3">3桁</option><option value="4">4桁</option></select></label>
@@ -150,8 +150,8 @@
         </section>
       </section>
 
-      <footer class="app-footer"><span>GEN 図面 一括出力 · v1.0</span><span>非公式ツール · 出力図は GEN NX の原図と照合してください</span></footer>
+      <footer class="app-footer"><span>GEN 図面 一括出力 · v1.1</span><span>非公式ツール · 出力図は GEN NX の原図と照合してください</span></footer>
     </main>
-    <script src="./app.js?v=1.0.0"></script>
+    <script src="./app.js?v=1.1.0"></script>
   </body>
 </html>
